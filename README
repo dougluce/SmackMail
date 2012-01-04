@@ -1,0 +1,25 @@
+The goal of this project is to allow me to migrate from Pine to
+Emacs.  What I want includes:
+
+* IMAP integration
+  - Be able to connect to SSLized IMAP servers
+  - Be able to save to IMAP folders
+  - Especially the sent-mail folder
+  - Be able to list folders that I've got up.
+* Support for single-window operation
+  - When I'm looking at email, I'm looking at email.  When I go into
+    one, I'm reading just that email.  When I edit, there's nothing on
+    my screen except for the email I'm editing.
+* Attachment management
+  - Be able to bulk save attachments
+* Single-key shortcuts for nearly everything
+* MIME support
+  - Show what's possible to show (i.e. support for graphics on
+     displays that support it)
+  - Have easy-to-specify commands for parsing everything else
+* Selection of emails
+  - By search term
+  - Group actions: delete, save, export, flag, pipe.
+  - Have a selection ring
+  - Narrow on selected
+
