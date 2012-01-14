@@ -74,8 +74,6 @@ afterwards."
        (unwind-protect (progn (,@ body))
          (setq buffer-read-only bro)))))
 
-
-
 (defun goto-marker (mark)
   (set-buffer (marker-buffer mark))
   (goto-char (marker-position mark)))
@@ -116,25 +114,57 @@ ISNEW should be non-0 if this is a new message."
   (if (and smack-started-from-shell smack-exit-to-shell)
       (save-buffers-kill-emacs)))
 
-(defun smack-get-captions ()
+
+(defun smack-fetch-and-insert (seq imapbuf)
+  (let* ((envelope (imap-fetch seq "ENVELOPE" 'ENVELOPE nil imapbuf))
+	 (env-date (aref envelope 0))
+	 (env-subject (aref envelope 1))
+	 (env-from (address (aref envelope 2)))
+	 (env-sender (address (aref envelope 3)))
+	 (env-reply-to (address (aref envelope 4)))
+	 (env-to (address (aref envelope 5)))
+	 (env-cc (address (aref envelope 6)))
+	 (env-bcc (aref envelope 7))
+	 (env-in-reply-to (aref envelope 8))
+	 (env-message-id (aref envelope 9 )))
+    (temp-set-buffer smack-captions-buf
+		     (ignoring-read-only
+		       (smack-add-caption (number-to-string seq)
+					  (format "%s %s %s" env-date env-subject env-from) 0)))))
+
+(defun smack-get-captions (&rest folders)
   "Update captions for FOLDERS, which is a list of comma/whitespace
 separated folder names, each optionally suffixed with '*' to indicate
 the entire subtree under it, since DATE."
   (interactive)
+  (if (null folders) (setq folders "INBOX"))  ; Default.
   (setq bat-first-new-msg nil) ; what's this all about?
   (set-marker smack-last-caption-mark (point))  ; Fix, we may not be in the captions buffer.
-  (ignoring-read-only 
-    (smack-add-caption "1" "This, baby, is a caption!" 0)
-   (smack-add-caption "2" "And so is this." 1)))
 
-(defun i ()
-  (save-excursion
-    (let ((buffer (imap-open "breakout.horph.com")))
-      (unwind-protect
-	  (set-buffer buffer)
-	(imap-authenticate "mailtest" "testmail")
-	(setq im1 (imap-mailbox-list "*"))
-	(kill-buffer buffer)))))
+  (unwind-protect
+      (let ((imapbuf (imap-open "breakout.horph.com" 993 'tls)))
+	(with-current-buffer imapbuf
+	  (imap-authenticate "mailtest" "PASSWID" imapbuf)
+	  (imap-mailbox-select "INBOX" imapbuf)
+	  (let ((max (imap-mailbox-get 'exists "INBOX" imapbuf)))
+	    (dolist (seq (number-sequence (if (> max 10) (- max 10) 1) max))
+	      (smack-fetch-and-insert seq imapbuf)))))
+    (kill-buffer imapbuf)))
+
+
+(defun address (a)
+  (condition-case nil
+      (let ((addy (car a)))
+	(if (null (aref addy 0))
+	    (format "%s@%s" (aref addy 2) (aref addy 3))
+	  (format "%s <%s@%s>" (aref addy 0) (aref addy 2) (aref addy 3))))
+    (error a)))
+
+(defun disabled-key ()
+  "Displays an error message saying that this key is disabled."
+  (interactive)
+  (error "That key is disabled here"))
+
 
 (defun smack-make-captions-keymap ()
   "Returns the default smack-captions-mode keymap."
