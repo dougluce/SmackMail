@@ -22,4 +22,5 @@ Emacs.  What I want includes:
   - Group actions: delete, save, export, flag, pipe.
   - Have a selection ring
   - Narrow on selected
-
+* Addressbook
+  - Make a workable addressbook system for this.
