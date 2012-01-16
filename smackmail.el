@@ -11,7 +11,7 @@
 (defconst smack-captions-buf "*smack-captions*")
 (defconst smack-version "0.1" "SmackMail version number")
 (defconst smack-folder-update-buf " *smack-folder-update*")
-(defconst smack-cuid-cols 4)
+(defconst smack-uid-cols 4)
 
 (defvar smack-state nil "String describing current state of smackmail.")
 (defvar smack-new-mail-p nil "T if there is new mail.")
@@ -44,7 +44,8 @@ meaning don't checkpoint.")
 (defvar smack-started-from-shell nil)
 (defvar smack-last-caption-mark (make-marker))
 (defvar smack-first-new-msg (make-marker))
-(defvar smack-last-cuid 0)
+(defvar smack-begin-body-mark (make-marker))
+(defvar smack-last-uid 0)
 (defvar smack-exit-to-shell t
   "*If non-nil, quitting from a smackmail that was started from the shell
 will exit emacs as well.")
@@ -57,6 +58,8 @@ the shell.")
 (defvar smack-default-folders "*"
   "*Default set folders to prompt with when starting smackmail.")
 
+(defvar smack-local-strip t)
+
 (defmacro temp-set-buffer (bufname &rest body)
   "Make BUFFER the current buffer, then evaluate any remaining
 arguments.  The original current buffer is restored afterwards."
@@ -66,6 +69,11 @@ arguments.  The original current buffer is restored afterwards."
        (unwind-protect (progn (,@ body))
          (set-buffer oldbuf)))))
 
+(defvar smack-imap-buf nil)
+(defvar smack-display "")
+(defvar smack-more nil)
+
+
 (defmacro ignoring-read-only (&rest body)
   "Evaluates it's args while the current is writeable, restoring read-only
 afterwards."
@@ -74,21 +82,38 @@ afterwards."
        (unwind-protect (progn (,@ body))
          (setq buffer-read-only bro)))))
 
+(defmacro temp-set-or-pop-to-buffer (bufname pop &rest body)
+  "Make BUFFER the current buffer, and if POP is non-nil make sure it's
+visible on the screen, then evaluate any remaining arguments.  The original
+buffer is restored afterwards."
+  (` (let ((buf (get-buffer-create (, bufname)))
+           (oldbuf (current-buffer)))
+       (if (, pop)
+           (pop-to-buffer buf)
+         (set-buffer buf))
+       (unwind-protect (progn (,@ body))
+         (pop-to-buffer oldbuf)))))
+
+
+
+
+
 (defun goto-marker (mark)
   (set-buffer (marker-buffer mark))
   (goto-char (marker-position mark)))
 
 
-(defun smack-add-caption (cuid caption isnew)
-  "Add an entry for CUID and CAPTION to the folder currently being updated.
+(defun smack-add-caption (uid caption isnew)
+  "Add an entry for UID and CAPTION to the folder currently being updated.
 ISNEW should be non-0 if this is a new message."
   (temp-set-buffer smack-folder-update-buf
     (goto-marker smack-last-caption-mark)
     (if (and (/= isnew 0) (null smack-first-new-msg))
-        (setq smack-first-new-msg cuid))
-    (insert (concat cuid))
-    (indent-to-column (1+ smack-cuid-cols)) ; +1 for update-mark column
+        (setq smack-first-new-msg uid))
+    (insert (concat uid))
+    (indent-to-column (1+ smack-uid-cols)) ; +1 for update-mark column
     (insert caption "\n")
+    (put-text-property smack-last-caption-mark (point) 'uid seq)
     (set-marker smack-last-caption-mark (point))))
 
 (defun smack-quit ()
@@ -104,33 +129,75 @@ ISNEW should be non-0 if this is a new message."
              (set-buffer (window-buffer (selected-window)))))
   (setq smack-reading nil)
   (setq smack-active nil)
-  (setq smack-last-cuid 0)
+  (setq smack-last-uid 0)
   (kill-buffer smack-captions-buf)
   (kill-buffer smack-display-buf)
   (kill-buffer smack-metamail-buf)
   (kill-buffer smack-scratch-buf)
+  (kill-buffer smack-imap-buf)
   (bury-buffer smack-composition-buf)  ; Really want to kill it safely.
 
   (if (and smack-started-from-shell smack-exit-to-shell)
       (save-buffers-kill-emacs)))
 
+(defun iseven (x)
+  (= (mod x 2) 0))
 
-(defun smack-fetch-and-insert (seq imapbuf)
-  (let* ((envelope (imap-fetch seq "ENVELOPE" 'ENVELOPE nil imapbuf))
-	 (env-date (aref envelope 0))
-	 (env-subject (aref envelope 1))
-	 (env-from (address (aref envelope 2)))
-	 (env-sender (address (aref envelope 3)))
-	 (env-reply-to (address (aref envelope 4)))
-	 (env-to (address (aref envelope 5)))
-	 (env-cc (address (aref envelope 6)))
-	 (env-bcc (aref envelope 7))
-	 (env-in-reply-to (aref envelope 8))
-	 (env-message-id (aref envelope 9 )))
-    (temp-set-buffer smack-captions-buf
-		     (ignoring-read-only
-		       (smack-add-caption (number-to-string seq)
-					  (format "%s %s %s" env-date env-subject env-from) 0)))))
+(defun sub (s n)
+  (let ((w (length s)))
+    (substring s 0 (if (> n w) w n))))
+
+; Fit it into 4 chars.
+(defun normsize (s) 
+  (cond 
+   ((< s 10000)
+    (format "(%d)" s))
+   ((< s 999500)
+    (format "(%dK)" (round (/ s 1000.0))))
+   ((< s 99950000)
+    (format "(%.1fM)" (/ (round (/ s 100000.0)) 10.0)))
+   ((<= s 999500000)
+    (format "(%dM)" (round (/ s 1000000.0))))
+   (t
+    "(HUGE!)")))
+
+(defun smack-fetch-and-insert (seq max)
+  (with-current-buffer smack-imap-buf
+    (let* ((envelope (imap-fetch seq "ALL" 'ENVELOPE nil smack-imap-buf))
+	   (yuck (setq envvv envelope))
+	   (env-size (normsize (imap-message-get seq 'RFC822.SIZE)))
+	   (env-date (aref envelope 0))
+	   (env-subject (aref envelope 1))
+	   (env-from (address (aref envelope 2)))
+	   (env-sender (address (aref envelope 3)))
+	   (env-reply-to (address (aref envelope 4)))
+	   (env-to (address (aref envelope 5)))
+	   (env-cc (address (aref envelope 6)))
+	   (env-bcc (aref envelope 7))
+	   (env-in-reply-to (aref envelope 8))
+	   (env-message-id (aref envelope 9 ))
+	   (number-width (+ 2 (truncate (log10 max))))
+	   (status-width 5)
+	   (date-width 11)
+	   (size-width 6)
+	   (inter-width 4)
+	   (w (window-width))
+	   (fixed-widths (+ date-width size-width number-width status-width inter-width))
+	   (fromto-width (+ (round (* .33 (- w fixed-widths)))))
+	   (fromto-width (+ fromto-width (if (iseven fromto-width) 1 0)))
+	   (from-width (/ (- fromto-width 1) 2))
+	   (subject-width (- w fixed-widths fromto-width))
+	   (caption-format (format "%%-%ds %%-%ds %%-%ds %%%ds %%-%ds" 
+				   status-width date-width fromto-width size-width subject-width))
+	   (fromto-format (format "%%-%ds %%-%ds" fromto-width fromto-width))
+	   (fromto (format fromto-format (sub env-from from-width) (sub env-to from-width)))
+	   (status "")			; For future use
+	   (caption (format caption-format
+			    (sub status status-width) (sub env-date date-width) (sub fromto fromto-width)
+			    (sub env-size size-width) (sub env-subject subject-width))))
+      (temp-set-buffer smack-captions-buf
+		       (ignoring-read-only
+			 (smack-add-caption (number-to-string seq) caption 0))))))
 
 (defun smack-get-captions (&rest folders)
   "Update captions for FOLDERS, which is a list of comma/whitespace
@@ -138,18 +205,12 @@ separated folder names, each optionally suffixed with '*' to indicate
 the entire subtree under it, since DATE."
   (interactive)
   (if (null folders) (setq folders "INBOX"))  ; Default.
-  (setq bat-first-new-msg nil) ; what's this all about?
+  (setq smack-first-new-msg nil) ; what's this all about?
   (set-marker smack-last-caption-mark (point))  ; Fix, we may not be in the captions buffer.
+  (let ((max (imap-mailbox-get 'exists "INBOX" smack-imap-buf)))
+    (dolist (seq (number-sequence (if (> max 10) (- max 10) 1) max))
+      (smack-fetch-and-insert seq max))))
 
-  (unwind-protect
-      (let ((imapbuf (imap-open "breakout.horph.com" 993 'tls)))
-	(with-current-buffer imapbuf
-	  (imap-authenticate "mailtest" "PASSWID" imapbuf)
-	  (imap-mailbox-select "INBOX" imapbuf)
-	  (let ((max (imap-mailbox-get 'exists "INBOX" imapbuf)))
-	    (dolist (seq (number-sequence (if (> max 10) (- max 10) 1) max))
-	      (smack-fetch-and-insert seq imapbuf)))))
-    (kill-buffer imapbuf)))
 
 
 (defun address (a)
@@ -159,6 +220,82 @@ the entire subtree under it, since DATE."
 	    (format "%s@%s" (aref addy 2) (aref addy 3))
 	  (format "%s <%s@%s>" (aref addy 0) (aref addy 2) (aref addy 3))))
     (error a)))
+
+
+(defun smack-set-display (str)
+  "Sets the currently displayed message indicator to STRING."
+  (setq smack-display str)
+  (refresh-modeline))
+
+
+(defun smack-fixup-display-buf ()
+  "Fixes up the modeline for the smack-display buffer to more accurately
+reflect the actual state of the buffer."
+  (when (buffer-visible-p)
+    (move-to-window-line -1)
+    (let ((more (not (looking-at "[ \t\n]*\\'"))))
+      (if (not (equal more smack-more))
+          (refresh-modeline))
+      (setq smack-more more))
+    (move-to-window-line nil)))
+
+(defvar smack-default-folder nil)
+
+(defun smack-set-default-folder (folder)
+  "Sets the \"default\" folder to FOLDER.  Nil will revert back to
+the current folder."
+  (setq smack-default-folder folder))
+
+
+(defun delete-current-buffer-contents ()
+  (delete-region (point-min) (point-max)))
+
+
+
+(defun smack-body (uid)
+  "Makes the contents of imap message associated with uid the currently
+displayed message, and updates the current update mark if necessary."
+  (temp-set-or-pop-to-buffer smack-display-buf (not smack-suspended)
+    (delete-current-buffer-contents)
+    (insert (imap-message-body uid smack-imap-buf))
+    (setq smack-last-uid uid)
+    (smack-set-display (concat "Body of message " uid))
+    (refresh-modeline)
+    (search-forward "\n\n" nil t)
+    (while (and (not (eobp)) (eolp))
+      (delete-char 1))
+
+    (set-marker smack-begin-body-mark (point))
+    (save-excursion (run-hooks 'smack-body-hook))
+    (smack-fixup-display-buf)
+    )
+  (smack-set-default-folder nil))
+
+
+
+(defun smack-get-uid ()
+  "Returns the imap UID of the caption at the current point position."
+  (beginning-of-line)
+  (get-text-property (point) 'uid))
+
+
+(defun smack-pick ()
+  "If the current point position is on a different caption than
+the last time this was called, display the message associated
+with that caption.  Otherise, if the currently displayed message
+can be scrolled, do so, otherwises (smack-next-caption)."
+  (interactive)
+  (let ((uid (smack-get-uid)))
+    (cond ((null uid)
+           (smack-next-caption))
+          ((/= uid smack-last-uid)
+           (setq smack-local-strip 1)
+	   (smack-body uid))
+          ((bat-scroll-body)            ; returns t if at end
+           (bat-next-caption)))))
+
+
+
 
 (defun disabled-key ()
   "Displays an error message saying that this key is disabled."
@@ -214,7 +351,7 @@ the entire subtree under it, since DATE."
 (defvar smack-caption-percentage 30
   "*Percentage of screen height used for the captions.  If negative, splits
 windows horizontally.")
-(defvar smack-replying-to 0 "Cuid of mail we're replying to.")
+(defvar smack-replying-to 0 "UID of mail we're replying to.")
 
 (defun smack-create-display-buf ()
   "Create the smack-display buffer, put it in smack-display-mode,
@@ -407,6 +544,10 @@ the previous screen layout."
 	 (if smack-suspend-on-start
 	     (smack-suspend)
 	     (smack-set-up-screen))
+	 (setq smack-imap-buf (imap-open "breakout.horph.com" 993 'tls))
+	 (with-current-buffer smack-imap-buf
+	   (imap-authenticate "mailtest" (getenv "MAILTESTPW") smack-imap-buf)
+	   (imap-mailbox-select "INBOX" smack-imap-buf))
 	 (smack-get-captions))
 	(smack-suspended
 	 ;; redo the window config if un-suspending
